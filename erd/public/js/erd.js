@@ -48,15 +48,17 @@ const LINK_TYPES = new Set(['Link','Table','Table MultiSelect']);
 
 function fieldColor(ft) { return FIELD_COLORS[ft] || '#64748b'; }
 
-async function apiFetch(method, params = {}) {
-  const url = new URL(`/api/method/${method}`, location.origin);
-  for (const [k, v] of Object.entries(params)) {
-    if (v != null && v !== '') url.searchParams.set(k, String(v));
-  }
+async function listFetch(doctype, { fields = [], filters = [], orderBy = '', limit = 0 } = {}) {
+  const url = new URL(`/api/resource/${encodeURIComponent(doctype)}`, location.origin);
+  url.searchParams.set('limit_page_length', limit);
+  if (fields.length)  url.searchParams.set('fields',   JSON.stringify(fields));
+  if (filters.length) url.searchParams.set('filters',  JSON.stringify(filters));
+  if (orderBy)        url.searchParams.set('order_by', orderBy);
   const res = await fetch(url, { credentials: 'include' });
-  if (!res.ok) throw new Error(`${method} → ${res.status}`);
-  return (await res.json()).message;
+  if (!res.ok) throw new Error(`${doctype} → ${res.status}`);
+  return (await res.json()).data ?? [];
 }
+
 
 /* ─────────────────────────────────────────── */
 
@@ -76,6 +78,7 @@ class ERDApp {
     this._pan         = null;
     this._drag        = null;
     this._didDrag     = false;
+    this._justDragged = false;
     this._hlNodes     = null;  // Set<string> | null
     this._hlEdge      = null;  // { src, tgt } | null
 
@@ -97,13 +100,16 @@ class ERDApp {
   async init() {
     this._showLoading(true);
     try {
-      this.modules = await apiFetch('erd.api.database.get_modules');
+      const [modRows, dtRows] = await Promise.all([
+        listFetch('Module Def', { fields: ['name'], orderBy: 'name asc' }),
+        listFetch('DocType',    { fields: ['name', 'module', 'istable'] }),
+      ]);
+      this.modules = modRows.map(r => r.name);
       this.modules.forEach((m, i) => {
         this.moduleColors[m] = MODULE_PALETTE[i % MODULE_PALETTE.length];
         this.collapsed.add(m);
       });
-      const dts = await apiFetch('erd.api.database.get_doctypes');
-      for (const dt of dts) this.allDoctypes[dt.name] = dt;
+      for (const dt of dtRows) this.allDoctypes[dt.name] = dt;
 
       const saved = this._loadState();
       if (saved) {
@@ -114,10 +120,7 @@ class ERDApp {
         const toRestore = Object.keys(saved.canvas || {}).filter(n => this.allDoctypes[n]);
         if (toRestore.length) {
           const toFetch = toRestore.filter(n => !this.schema[n]);
-          if (toFetch.length) {
-            const chunk = await apiFetch('erd.api.database.get_schema', { doctypes: toFetch.join(',') });
-            Object.assign(this.schema, chunk);
-          }
+          if (toFetch.length) await this._fetchSchema(toFetch);
           for (const name of toRestore) {
             if (this.schema[name]) {
               const { x, y } = saved.canvas[name];
@@ -226,6 +229,7 @@ class ERDApp {
       }
     });
     this.$canvas.addEventListener('click', e => {
+      if (this._justDragged) { this._justDragged = false; return; }
       if (e.target === this.$canvas || e.target.id === 'nodes-layer' || e.target.id === 'canvas-transform') {
         this._clearHighlight();
       }
@@ -252,6 +256,9 @@ class ERDApp {
       if (this._drag) {
         this.canvasNodes.get(this._drag.name)?.el.classList.remove('dragging');
         this._saveState();
+        this._justDragged = true;
+      } else if (this._pan) {
+        this._justDragged = true;
       }
       this._pan = null;
       this._drag = null;
@@ -272,6 +279,35 @@ class ERDApp {
       this.transform.scale = ns;
       this._applyTransform();
     }, { passive: false });
+  }
+
+  /* ── Schema fetch ── */
+  async _fetchSchema(names) {
+    const CHUNK = 15;
+    const chunks = [];
+    for (let i = 0; i < names.length; i += CHUNK) chunks.push(names.slice(i, i + CHUNK));
+
+    const pairs = await Promise.all(chunks.map(chunk => Promise.all([
+      listFetch('DocType', {
+        filters: [['name', 'in', chunk]],
+        fields:  ['name', 'issingle', 'is_virtual', 'istable', 'module',
+                  'title_field', 'description', 'read_only', 'document_type',
+                  'is_submittable', 'custom'],
+      }),
+      listFetch('DocField', {
+        filters: [['parent', 'in', chunk], ['parentfield', '=', 'fields']],
+        fields:  ['name', 'parent', 'fieldname', 'label', 'fieldtype', 'options',
+                  'hidden', 'reqd', 'unique', 'default', 'description',
+                  'read_only', 'is_virtual', 'not_nullable'],
+        orderBy: 'parent asc, idx asc',
+      }),
+    ])));
+
+    const metaRows  = pairs.flatMap(([m]) => m);
+    const fieldRows = pairs.flatMap(([, f]) => f);
+    for (const dt of metaRows) {
+      this.schema[dt.name] = { ...dt, fields: fieldRows.filter(f => f.parent === dt.name) };
+    }
   }
 
   /* ── Sidebar ── */
@@ -343,10 +379,17 @@ class ERDApp {
     const toFetch = [...this.checked].filter(n => !this.schema[n]);
     this._showLoading(true);
     try {
-      if (toFetch.length) {
-        const chunk = await apiFetch('erd.api.database.get_schema', { doctypes: toFetch.join(',') });
-        Object.assign(this.schema, chunk);
+      if (toFetch.length) await this._fetchSchema(toFetch);
+
+      // Remove unchecked nodes
+      for (const name of [...this.canvasNodes.keys()]) {
+        if (!this.checked.has(name)) {
+          this.canvasNodes.get(name).el.remove();
+          this.canvasNodes.delete(name);
+        }
       }
+
+      // Add newly checked nodes
       let added = 0;
       for (const name of this.checked) {
         if (!this.canvasNodes.has(name) && this.schema[name]) {
@@ -354,7 +397,7 @@ class ERDApp {
           added++;
         }
       }
-      if (added) this._computeLayout();
+      if (added || this.canvasNodes.size) this._computeLayout();
       this._updateHint();
       this._saveState();
       this._renderSidebar();
